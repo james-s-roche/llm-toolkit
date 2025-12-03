@@ -3,3 +3,5 @@ llms_env/
 __pycache__/
 *.pyc
 .env
+.openrouter_models_cache.json
+notes.txt

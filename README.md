@@ -1,6 +1,6 @@
 # llm-wrappers
 
-Lightweight Python wrappers to experiment with several LLM backends (OpenAI, Hugging Face Inference API, and local Transformers). This repository is now arranged as a flat, self-contained layout so you can run examples and the Streamlit UI without installing the package.
+Lightweight Python wrappers to experiment with several LLM backends (OpenRouter, OpenAI, Hugging Face Inference API, and local Transformers). 
 
 ## What's included
 
@@ -15,26 +15,26 @@ Lightweight Python wrappers to experiment with several LLM backends (OpenAI, Hug
 
 1. (Optional) create and activate a virtual environment:
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
+```
+python -m venv llms_env
+source source llms_env/bin/activate
 ```
 
 2. Install the optional dependencies you need. For example, to run the Streamlit UI and tests:
 
-```bash
+```
 pip install -r requirements.txt
 ```
 
 3. Run tests (the package is importable directly from the repository root):
 
-```bash
+```
 PYTHONPATH=. pytest -q
 ```
 
 4. Run the interactive CLI (it will use environment variables, `.env`, or macOS Keychain for API keys):
 
-```bash
+```
 python examples/interactive_cli.py --backend openai --model gpt-3.5-turbo
 ```
 
