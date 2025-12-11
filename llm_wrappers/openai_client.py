@@ -1,137 +1,134 @@
-from typing import Any, Generator, Optional
-import json
+from __future__ import annotations
 
-from .base import BaseLLM
+from dataclasses import dataclass
+from typing import Generator, Iterable, List, Optional
 
-class OpenAIClient(BaseLLM):
-    """OpenAI client for openai>=1.0.0 (the new OpenAI Python SDK).
+from openai import OpenAI
+from openai.types.chat import ChatCompletion, ChatCompletionChunk
+from openai.types import Model
 
-    This client constructs an `openai.OpenAI` client instance and uses
-    `client.chat.completions.create` and `client.chat.completions.stream`.
 
-    It intentionally drops support for the pre-1.0 `openai.ChatCompletion` API.
+@dataclass(frozen=True)
+class OpenAIModelInfo:
+    id: str
+    created: Optional[int] = None
+    owned_by: Optional[str] = None
+
+    @staticmethod
+    def from_sdk(m: Model) -> "OpenAIModelInfo":
+        # Model objects include id, created, owned_by (and other fields); keep only the basics here.
+        return OpenAIModelInfo(
+            id=getattr(m, "id", None) or "",
+            created=getattr(m, "created", None),
+            owned_by=getattr(m, "owned_by", None),
+        )
+
+
+class OpenAIClient:
+    """
+    Minimal OpenAI client wrapper for openai>=1.x
+
+    - Uses Chat Completions API for text generation.
+    - Provides streaming and non-streaming methods.
+    - Exposes models() to list available models from the account.
     """
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-3.5-turbo"):
-        try:
-            # import on demand so the package can be imported without optional deps
-            from openai import OpenAI
-        except Exception as e:
-            raise RuntimeError("openai>=1.0 is required for OpenAIClient; install with `pip install openai`") from e
-
-        # Instantiate the modern OpenAI client. If api_key is provided we pass it
-        # via the environment variable which the SDK will pick up, otherwise rely
-        # on standard configuration.
-        if api_key:
-            # set temporary attribute on env for client (the SDK also accepts explicit config in some versions)
-            import os
-
-            os.environ.setdefault("OPENAI_API_KEY", api_key)
-
-        try:
-            self._client = OpenAI()
-        except Exception as e:
-            raise RuntimeError("Failed to initialize OpenAI client: ensure openai package is configured and OPENAI_API_KEY is set") from e
-
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None, timeout: Optional[float] = 180.0):
+        self.client = OpenAI(api_key=api_key, timeout=timeout)
         self.model = model
 
-    def _extract_text_from_choice(self, choice: Any) -> Optional[str]:
-        # Handle multiple response shapes: object attrs or dicts.
+    # -------------------------------
+    # Models
+    # -------------------------------
+    def models(self) -> List[OpenAIModelInfo]:
+        """Return available models for the account."""
         try:
-            # object style: choice.message.content
-            msg = getattr(choice, "message", None)
-            if msg is not None:
-                cont = getattr(msg, "content", None)
-                if cont:
-                    return cont
-        except Exception:
-            pass
+            resp = self.client.models.list()
+            # resp.data is a list[Model]
+            return [OpenAIModelInfo.from_sdk(m) for m in resp.data]
+        except Exception as e:
+            # Let callers decide how to surface this; keep message clear.
+            raise RuntimeError(f"Failed to list OpenAI models: {e}") from e
 
-        try:
-            # dict style
-            if isinstance(choice, dict):
-                msg = choice.get("message")
-                if isinstance(msg, dict):
-                    return msg.get("content")
-        except Exception:
-            pass
+    # -------------------------------
+    # Non-streaming generation
+    # -------------------------------
+    def generate(
+        self,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        system: Optional[str] = None,
+    ) -> str:
+        """
+        Return the assistant text for a single-turn prompt.
+        """
+        use_model = model or self.model
+        if not use_model:
+            raise ValueError("No model specified for OpenAI generate()")
 
-        # fallback None
-        return None
-
-    def generate(self, prompt: str, **kwargs: Any) -> Any:
-        messages = kwargs.pop("messages", None)
-        if messages is None:
-            messages = [{"role": "user", "content": prompt}]
-
-        # Use the modern client create API
-        resp = self._client.chat.completions.create(model=self.model, messages=messages, **kwargs)
-
-        # Try to extract the primary text from the response
-        try:
-            # object-like
-            first = resp.choices[0]
-            text = self._extract_text_from_choice(first)
-            if text:
-                return text
-        except Exception:
-            pass
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
 
         try:
-            # dict-like
-            if isinstance(resp, dict):
-                return resp.get("choices", [])[0].get("message", {}).get("content")
-        except Exception:
-            pass
+            completion: ChatCompletion = self.client.chat.completions.create(
+                model=use_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            raise RuntimeError(f"OpenAI chat.completions.create failed: {e}") from e
 
-        # Last resort: return string representation
-        return str(resp)
+        # The SDK guarantees choices[0].message.content is Optional[str]
+        if not completion.choices:
+            return ""
+        return completion.choices[0].message.content or ""
 
-    def stream_generate(self, prompt: str, **kwargs: Any) -> Generator[str, None, None]:
-        messages = kwargs.pop("messages", None)
-        if messages is None:
-            messages = [{"role": "user", "content": prompt}]
+    # -------------------------------
+    # Streaming generation
+    # -------------------------------
+    def stream_generate(
+        self,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        system: Optional[str] = None,
+    ) -> Generator[str, None, None]:
+        """
+        Yield assistant text chunks as they arrive. Yields only the delta content strings.
+        """
+        use_model = model or self.model
+        if not use_model:
+            raise ValueError("No model specified for OpenAI stream_generate()")
 
-        # The modern SDK exposes a `stream` helper which yields events. We'll
-        # iterate and extract token deltas when possible. If streaming isn't
-        # available, fall back to a single generate call.
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
         try:
-            stream = self._client.chat.completions.stream(model=self.model, messages=messages, **kwargs)
-        except Exception:
-            # streaming may not be supported in this environment; fall back
-            yield self.generate(prompt, **kwargs)
-            return
+            stream: Iterable[ChatCompletionChunk] = self.client.chat.completions.create(
+                model=use_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+        except Exception as e:
+            raise RuntimeError(f"OpenAI chat.completions.create(stream) failed: {e}") from e
 
-        # Iterate the stream and yield textual chunks
-        for event in stream:
-            try:
-                # event may have choices with delta
-                choices = getattr(event, "choices", None) or (event.get("choices") if isinstance(event, dict) else None)
-                if choices:
-                    for c in choices:
-                        # delta can be object or dict
-                        delta = getattr(c, "delta", None) or (c.get("delta") if isinstance(c, dict) else None)
-                        if delta is None:
-                            # some events embed a full message
-                            text = self._extract_text_from_choice(c)
-                            if text:
-                                yield text
-                        else:
-                            # delta may contain 'content'
-                            if isinstance(delta, dict):
-                                text = delta.get("content")
-                            else:
-                                text = getattr(delta, "content", None)
-                            if text:
-                                yield text
-                else:
-                    # fallback: stringify event
-                    try:
-                        yield json.dumps(event)
-                    except Exception:
-                        yield str(event)
-            except GeneratorExit:
-                raise
-            except Exception:
-                # ignore malformed stream items
+        for chunk in stream:
+            # chunk.choices[0].delta.content may be None for non-text deltas; normalize to empty string
+            if not chunk.choices:
                 continue
+            delta = chunk.choices[0].delta
+            text = getattr(delta, "content", None)
+            if text:
+                yield text
